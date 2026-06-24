@@ -1,279 +1,214 @@
-# GNews API MCP Server
+# demo-gnews-remotemcp-auth
 
-A Model Context Protocol (MCP) server built on [FastAPI](https://fastapi.tiangolo.com/) that provides access to the [GNews API](https://gnews.io/) for fetching news articles and headlines. The server now runs as a remote MCP server on top of a FastAPI app, supporting HTTP transport and modern authentication middleware. This enables AI applications to search for news, get trending headlines, and access comprehensive news data through a standardized interface with robust security.
+A **remote, authenticated** [MCP](https://modelcontextprotocol.io/) (Model
+Context Protocol) server that brings the [GNews API](https://gnews.io/) to any AI
+agent — protected with **OAuth 2.1** and **deployed to the public internet**.
 
-## Features
+It's built with the **FastMCP** tools from the official
+[Python SDK](https://github.com/modelcontextprotocol/python-sdk), wrapped in a
+[FastAPI](https://fastapi.tiangolo.com/) app that adds an OAuth auth middleware
+([Scalekit](https://www.scalekit.com/) as the authorization server) and the
+discovery endpoint required by the MCP authorization spec. The result is a news
+search service that an agent connects to **by URL** and can only use after a real
+OAuth login.
 
-### 🔧 Tools
-- **`search_news`** - Search for news articles using keywords with advanced filtering
-- **`get_top_headlines`** - Get trending news articles by category
+> **Live deployment:** `https://mcp-dev-guide.onrender.com/mcp/`
+> Hosted on [Render](https://render.com/), connected to **Claude** — the OAuth
+> flow runs in the browser and the GNews tools work end-to-end.
 
+## What this demo shows
 
-## Installation & Setup
+This is the "final boss" of a remote MCP setup — everything wired together and
+actually running in production:
 
-1. **Clone or download this repository**
-  ```bash
-  git clone <repository-url>
-  cd gnews-server
-  ```
+- A FastMCP server exposing real tools (`search_news`, `get_top_headlines`).
+- **Streamable HTTP** transport, so the server is a long-lived web service rather
+  than a local subprocess.
+- **OAuth 2.1** enforcement on every tool call, with scope checks (`gnews:read`).
+- The OAuth **discovery endpoint** that lets clients (Claude, VS Code, …) find
+  the authorization server and authenticate automatically.
+- A working **public deployment** that a hosted client like Claude can reach.
 
-2. **Install dependencies**
-  ```bash
-  pip install -r requirements.txt
-  # or using uv
-  uv sync
-  ```
+## What's inside
 
-3. **Get a GNews API key**
-  - Visit [gnews.io](https://gnews.io/) 
-  - Sign up for a free account
-  - Get your API key from the dashboard
+| Tool                | GNews endpoint                          | Purpose                              |
+| ------------------- | --------------------------------------- | ------------------------------------ |
+| `search_news`       | `https://gnews.io/api/v4/search`        | Search articles by keyword/filters.  |
+| `get_top_headlines` | `https://gnews.io/api/v4/top-headlines` | Trending headlines by category.      |
 
-4. **Set up environment variables**
-  ```bash
-  export GNEWS_API_KEY="your_api_key_here"
-  ```
+Each tool's parameters (language, country, date range, sorting, pagination…) are
+generated from the typed Python signatures in [`gnews.py`](gnews.py), so the
+agent knows exactly what to pass.
 
-5. **Configure authentication**
-  - The server uses OAuth2 Bearer token authentication via ScaleKit. See `auth.py` for details.
-  - Set required ScaleKit environment variables in your config (see `config.py`).
+## Architecture
 
-## Usage
-
-### Running the Server
-
-The server now runs as a FastAPI application with MCP protocol support and authentication middleware.
-
-**Development mode:**
-```bash
-python main.py
+```
+                ┌───────────────────────── FastAPI (main.py) ─────────────────────────┐
+  MCP client ──▶│  GET /.well-known/oauth-protected-resource/mcp  → resource metadata   │
+  (HTTP +       │  AuthMiddleware (auth.py)                                             │
+   Bearer       │     ├─ /.well-known/*  → pass through (no auth)                       │
+   token)       │     └─ everything else → require + validate Bearer token via Scalekit │
+                │  mount "/"  → gnews_mcp.streamable_http_app()   (MCP endpoint /mcp)    │
+                └──────────────────────────────────────────────────────────────────────┘
+                                   │ validate_token (issuer, audience, scope gnews:read)
+                                   ▼
+                          Scalekit authorization server
+                                   │
+                                   ▼
+                            GNews API (the data)
 ```
 
-**Using uv:**
+The OAuth handshake the server drives:
+
+1. Client calls `POST /mcp` **without** a token → `401` + a `WWW-Authenticate`
+   header pointing at the resource-metadata URL.
+2. Client fetches `/.well-known/oauth-protected-resource/mcp` → learns which
+   **authorization server** (Scalekit) to use.
+3. Client registers / reuses an OAuth client and runs the OAuth 2.1 + PKCE login
+   in the browser.
+4. Client retries `POST /mcp` with `Authorization: Bearer <token>`. The
+   middleware checks the token's **issuer**, **audience**, and — for
+   `tools/call` — the `gnews:read` **scope**, then forwards the request to the
+   GNews tool.
+
+## Setup (local)
+
+Uses [uv](https://docs.astral.sh/uv/) and Python 3.13.
+
+```bash
+uv sync
+cp .env.example .env
+```
+
+Fill in `.env`:
+
+| Variable | Meaning |
+| --- | --- |
+| `GNEWS_API_KEY` | Your key from [gnews.io](https://gnews.io/) (the news data source). |
+| `SCALEKIT_ENVIRONMENT_URL` | Scalekit environment URL (token **issuer**). |
+| `SCALEKIT_CLIENT_ID` / `SCALEKIT_CLIENT_SECRET` | Scalekit client credentials. |
+| `SCALEKIT_RESOURCE_METADATA_URL` | URL of this server's discovery endpoint. |
+| `SCALEKIT_AUDIENCE_NAME` | Resource **audience** tokens are validated against (your MCP server URL). |
+| `METADATA_JSON_RESPONSE` | Single-line JSON returned by the discovery endpoint (RFC 9728). |
+| `PORT` | Port to listen on (default `10000`). |
+
+> In `METADATA_JSON_RESPONSE`, the `resource` field must match the URL clients
+> connect to (e.g. `https://mcp-dev-guide.onrender.com/mcp`). If it differs, the
+> client rejects the metadata and the OAuth flow silently fails.
+
+## Running (local)
+
 ```bash
 uv run main.py
 ```
 
-The server exposes MCP endpoints over HTTP, including a well-known OAuth-protected resource metadata endpoint at:
+Serves on `http://0.0.0.0:10000` — MCP endpoint at `/mcp`, discovery at
+`/.well-known/oauth-protected-resource/mcp`. Keep the process alive; it's a
+remote server clients connect to by URL.
+
+Sanity checks:
+
+```bash
+curl -s http://localhost:10000/.well-known/oauth-protected-resource/mcp   # → 200 + metadata JSON
+curl -i -X POST http://localhost:10000/mcp -H 'Content-Type: application/json' -d '{}'  # → 401 + WWW-Authenticate
 ```
-/.well-known/oauth-protected-resource/mcp
+
+## Deployment (Render)
+
+This server runs live on [Render](https://render.com/). Because it's part of a
+monorepo, the service points at this subdirectory:
+
+- **Root directory:** `05_demo-gnews-remotemcp-auth`
+- **Build command:** `uv sync`
+- **Start command:** `uv run main.py` (Uvicorn binds `0.0.0.0:$PORT`)
+- **Environment variables:** `GNEWS_API_KEY` + all `SCALEKIT_*` + `METADATA_JSON_RESPONSE`
+  set in the Render dashboard (never committed — `.env` is gitignored).
+
+Once deployed, the public MCP endpoint is:
+
+```
+https://mcp-dev-guide.onrender.com/mcp/
 ```
 
+Make sure `SCALEKIT_AUDIENCE_NAME`, the `resource` in `METADATA_JSON_RESPONSE`,
+and the Scalekit-registered resource identifier all match this public URL.
 
-### Integration with Claude Desktop & Other MCP Clients
+## Connecting it to an agent
 
-Add to your Claude Desktop configuration file (`claude_desktop_config.json`):
+### Claude (tested ✅)
+
+Add the remote server by its public URL. Claude discovers the metadata, opens a
+browser for the Scalekit login, stores the token, and then exposes `search_news`
+and `get_top_headlines` as tools:
+
+```
+https://mcp-dev-guide.onrender.com/mcp/
+```
+
+### VS Code
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "gnews": {
-      "command": "python",
-      "args": ["/absolute/path/to/gnews-server/main.py"],
-      "env": {
-        "GNEWS_API_KEY": "your_api_key_here"
-      }
+      "type": "http",
+      "url": "https://mcp-dev-guide.onrender.com/mcp/"
     }
   }
 }
 ```
 
-The server supports the standard MCP protocol and can be used with any MCP-compatible client. Use HTTP transport for remote connections, or stdio for local development.
+### Claude Code (CLI)
 
-### Integration with Other MCP Clients
-
-The server supports the standard MCP protocol and can be used with any MCP-compatible client. Use the stdio transport for local connections.
-
-
-## Authentication
-
-The server uses OAuth2 Bearer token authentication via ScaleKit. All requests (except for well-known endpoints) require a valid token in the `Authorization` header:
-
-```
-Authorization: Bearer <access_token>
+```bash
+claude mcp add --transport http gnews https://mcp-dev-guide.onrender.com/mcp/
+claude mcp list      # gnews ✓ connected after you authenticate
 ```
 
-Token validation and required scopes are handled by the `AuthMiddleware` (see `auth.py`). Unauthorized requests will receive a structured error response.
+## Tools reference
 
-## API Reference
+### `search_news`
+Search worldwide articles by keyword.
+- **`q`** (required) — keywords; supports `"phrases"`, `AND`, `OR`, `NOT`.
+- `lang`, `country` — 2-letter language / country codes.
+- `max_articles` — 1–100 (default 10).
+- `search_in` — fields to search: `title`, `description`, `content`.
+- `nullable` — fields allowed to be null: `description`, `content`, `image`.
+- `date_from`, `date_to` — ISO 8601 bounds.
+- `sortby` — `publishedAt` (default) or `relevance`.
+- `page` — pagination.
 
-### Tools
+### `get_top_headlines`
+Trending headlines by category.
+- `category` — `general` (default), `world`, `nation`, `business`, `technology`,
+  `entertainment`, `sports`, `science`, `health`.
+- `lang`, `country`, `max_articles`, `nullable`, `date_from`, `date_to`, `q`,
+  `page` — same meaning as in `search_news`.
 
-#### `search_news`
+Both require a token carrying the `gnews:read` scope and return GNews' standard
+`{ totalArticles, articles[] }` payload.
 
-Search for news articles using specific keywords.
+## Troubleshooting
 
-**Parameters:**
-- `q` (required): Search keywords with support for logical operators
-- `lang` (optional): Language code (2 letters, e.g., "en", "es")
-- `country` (optional): Country code (2 letters, e.g., "us", "gb") 
-- `max` (optional): Number of articles to return (1-100, default: 10)
-- `in` (optional): Search in specific fields: "title", "description", "content"
-- `nullable` (optional): Allow null values for: "description", "content", "image"
-- `from` (optional): Filter from date (ISO 8601 format)
-- `to` (optional): Filter until date (ISO 8601 format)
-- `sortby` (optional): Sort by "publishedAt" or "relevance"
-- `page` (optional): Page number for pagination
+- **`TypeError: fetch failed`** — server not reachable (local process stopped, or
+  Render service asleep/cold-starting). Free Render instances spin down when
+  idle; the first request after a pause can be slow.
+- **`Could not fetch resource metadata` / client uses the wrong auth server** —
+  discovery returned non-200 or `resource` doesn't match the client URL. Check
+  `METADATA_JSON_RESPONSE`.
+- **`Token validation failed`** — issuer/audience/scope mismatch; align
+  `SCALEKIT_ENVIRONMENT_URL` (issuer), `SCALEKIT_AUDIENCE_NAME` (audience), and
+  the `gnews:read` scope with what Scalekit issues.
 
-**Example queries:**
-```
-- "Apple iPhone"
-- "Apple AND iPhone"
-- "Apple OR Microsoft" 
-- "(Apple AND iPhone) OR Microsoft"
-- "Apple NOT iPhone"
-- "Apple iPhone 15" AND NOT "Apple iPhone 14"
-```
-
-**Returns:**
-```json
-{
-  "success": true,
-  "query": "search terms",
-  "totalArticles": 150,
-  "articles": [
-    {
-      "title": "Article Title",
-      "description": "Article description...",
-      "content": "Full article content...",
-      "url": "https://example.com/article",
-      "image": "https://example.com/image.jpg",
-      "publishedAt": "2024-01-01T12:00:00Z",
-      "source": {
-        "name": "Source Name",
-        "url": "https://source.com"
-      }
-    }
-  ],
-  "parameters_used": {...}
-}
-```
-
-#### `get_top_headlines`
-
-Get current trending news articles by category.
-
-**Parameters:**
-- `category` (optional): News category (default: "general")
-  - Available: "general", "world", "nation", "business", "technology", "entertainment", "sports", "science", "health"
-- `lang` (optional): Language code
-- `country` (optional): Country code
-- `max` (optional): Number of articles (1-100, default: 10)
-- `nullable` (optional): Allow null values
-- `from` (optional): Filter from date
-- `to` (optional): Filter until date  
-- `q` (optional): Additional search keywords
-- `page` (optional): Page number
-
-**Returns:** Similar structure to `search_news` with category-specific trending articles.
-
-### Resources
-
-#### `gnews://supported-languages`
-Returns a formatted list of all supported language codes and names.
-
-#### `gnews://supported-countries`  
-Returns a formatted list of all supported country codes and names.
-
-#### `gnews://query-syntax`
-Returns comprehensive documentation on search query syntax including logical operators, phrase search, and examples.
-
-### Prompts
-
-#### `create_news_search_prompt`
-Creates a structured prompt for comprehensive news research on a specific topic.
-
-**Parameters:**
-- `topic` (required): The topic to research
-- `days_back` (optional): Number of days to look back (default: 7)
-
-## Advanced Query Syntax
-
-The GNews API supports sophisticated search queries:
-
-### Logical Operators
-- **AND**: `Apple AND iPhone` (both terms must appear)
-- **OR**: `Apple OR Microsoft` (either term can appear)  
-- **NOT**: `Apple NOT iPhone` (exclude articles with "iPhone")
-
-### Phrase Search
-- **Exact phrases**: `"Apple iPhone 15"` (exact sequence)
-
-### Operator Precedence
-- OR has higher precedence than AND
-- Use parentheses for grouping: `(Apple AND iPhone) OR Microsoft`
-
-### Complex Examples
-```
-- Intel AND (i7 OR i9)
-- (Windows 7) AND (Windows 10)
-- "breaking news" AND NOT "rumor"
-- (Tesla OR "electric vehicle") AND NOT "stock price"
-```
-
-## Supported Languages
-
-Arabic (ar), Chinese (zh), Dutch (nl), English (en), French (fr), German (de), Greek (el), Hindi (hi), Italian (it), Japanese (ja), Malayalam (ml), Marathi (mr), Norwegian (no), Portuguese (pt), Romanian (ro), Russian (ru), Spanish (es), Swedish (sv), Tamil (ta), Telugu (te), Ukrainian (uk)
-
-## Supported Countries
-
-Australia (au), Brazil (br), Canada (ca), China (cn), Egypt (eg), France (fr), Germany (de), Greece (gr), Hong Kong (hk), India (in), Ireland (ie), Italy (it), Japan (jp), Netherlands (nl), Norway (no), Pakistan (pk), Peru (pe), Philippines (ph), Portugal (pt), Romania (ro), Russian Federation (ru), Singapore (sg), Spain (es), Sweden (se), Switzerland (ch), Taiwan (tw), Ukraine (ua), United Kingdom (gb), United States (us)
-
-
-## Error Handling & Security
-
-- **Authentication**: All endpoints (except well-known) require a valid OAuth2 Bearer token. Invalid or missing tokens result in a 401 Unauthorized response.
-- **API Key Validation**: Checks for required environment variable
-- **Parameter Validation**: Validates language codes, country codes, and numeric ranges
-- **Network Error Handling**: Graceful handling of connection issues
-- **API Error Responses**: Clear error messages from GNews API
-
-Error responses include:
-```json
-{
-  "success": false,
-  "error": "Error description",
-  "query": "original query",
-  "parameters_used": {...}
-}
-```
-
-## Rate Limits
-
-GNews API has rate limits based on your subscription plan:
-- **Free Plan**: 100 requests per day
-- **Paid Plans**: Higher limits available
-
-The server will return appropriate error messages if rate limits are exceeded.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-- **GNews API Documentation**: https://docs.gnews.io/
-- **MCP Specification**: https://modelcontextprotocol.io/
-- **Issues**: Please report bugs and feature requests through the repository's issue tracker
-
-
-## Example Usage in Claude
-
-After setting up the server, you can use it in Claude Desktop or any MCP client:
+## Project structure
 
 ```
-"Search for recent news about artificial intelligence developments in the last 3 days"
-"Get the top technology headlines from the United States"
-"Find news articles about climate change, but exclude articles about politics"
-"Show me breaking news about electric vehicles from European sources"
+main.py        # FastAPI app: lifespan, CORS, discovery endpoint, auth, MCP mount
+auth.py        # AuthMiddleware: Bearer extraction + Scalekit token validation
+config.py      # Settings loaded from .env
+gnews.py       # FastMCP server with search_news / get_top_headlines
+examples.py    # Example usage
+test_server.py # Tests
+Makefile       # install / run / test / format helpers
 ```
-
-The server will automatically use the appropriate tools and provide structured, comprehensive news results, with authentication and security enforced.
+</content>
